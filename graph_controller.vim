@@ -34,42 +34,83 @@
 "is necessary because gvpr kills your graph if you try to write to a file you're
 "currently trying to read from.
 
-let b:graph_file = '.graph.dot'
-let b:tmp_file = '.graph.dot.tmp'
-
 let s:empty_graph = 'digraph { graph [ layout = dot, rankdir=LR ] }'
 
-function! UpdateGraph(gvpr_cmd)
-  silent execute '! gvpr ''' . a:gvpr_cmd . ''' ' . b:graph_file . ' > ' . b:tmp_file
-  silent execute '! cat ' . b:tmp_file . ' > ' . b:graph_file
+let s:debug_mode = 't'
+let s:log_file = '.graph_controller.log'
+call writefile([''], s:log_file)
+
+function! InitLocals()
+  let b:graph_file = '.graph.dot'
+  let b:tmp_file = '.graph.dot.tmp'
 endfunction
 
-function! GetGraphInfo(gvpr_cmd)
-  silent execute '! gvpr ''' . a:gvpr_cmd . ''' ' . b:graph_file . ' > ' . b:tmp_file
-  let l:result = get(readfile(b:tmp_file), 0)
+function! Log(items)
+  call writefile(a:items + [''], s:log_file, 'a')
+endfunction
+
+function! LogSystemCmd(cmd)
+  let result = systemlist(a:cmd)
+  if exists('s:debug_mode')
+    call Log(['command: ' . a:cmd])
+    call Log(l:result)
+  endif
   return l:result
 endfunction
 
-function! InitGraph()
-  echom 'initializing graph for: ' . expand('%')
-  silent execute '! echo ''' . s:empty_graph . ''' > ' . b:graph_file
+function! UpdateGraph(gvpr_cmd)
+  let l:new_graph = LogSystemCmd("gvpr -q '" . a:gvpr_cmd . "' " . b:graph_file)
+  if !v:shell_error
+    call writefile(l:new_graph, b:graph_file)
+  elseif
+    Log(['gvpr error:', string(v:shell_error)])
+  endif
+endfunction
+
+function! GetGraphInfo(gvpr_cmd)
+  return LogSystemCmd("gvpr -q '" . a:gvpr_cmd . "' " . b:graph_file)
+endfunction
+
+function! OpenGraph()
+  "for some reason system() doesn't want to keep the thing open...
   silent execute '! dot -Txlib ' . b:graph_file '. &'
+  redraw!
+endfunction
+
+function! InitGraph()
+  call Log(['initializing graph for: ' . expand('%')])
+  call writefile([s:empty_graph], b:graph_file)
 endfunction
 
 function! GetSelectedNode()
-  let l:gvpr_cmd = 'N [aget($,"selected") == "true"] { printf("\%s\n", name) }'
-  return GetGraphInfo(l:gvpr_cmd)
+  let l:gvpr_cmd = 
+    \'gvpr -q ''N [selected == "true"] { printf(name) } '' ' . b:graph_file
+  return get(LogSystemCmd(l:gvpr_cmd), 0, -1)
+endfunction
+
+let s:location_attributes = [["shape","rectangle"],["color","blue"]]
+
+function! SetAttributes(label, attributes)
+  if empty(a:attributes) | return | endif
+  call Log(['setting attributes: ' . a:label . ' - ' . string(a:attributes)])
+  let l:gvpr_cmd = 
+    \'BEG_G {'
+      \'node_t n = node($,'. a:label . ');' .
+      join(map
+          (deepcopy(a:attributes),
+          '"aset(n,\"" . v:val[0] . "\",\"" . v:val[1] . "\");"')) .
+    \'}' .
+    \'N [] E []'
+  call UpdateGraph(l:gvpr_cmd)
 endfunction
 
 function! SelectNode(label)
-  echo 'SelectNode'
-  execute 'echom "selecting node: ' . a:label . '"'
   let l:gvpr_cmd = 
   \'N [name == "' . a:label . '"] { ' .
     \'aset($,"selected","true"); ' .
     \'aset($,"penwidth",3.0); ' .
   \'}' .
-  \'N [name \!= "' . a:label . '"] { ' .
+  \'N [name != "' . a:label . '"] { ' .
     \'aset($,"selected","false"); ' .
     \'aset($,"penwidth",1.0); ' .
   \'}' .
@@ -77,16 +118,18 @@ function! SelectNode(label)
   call UpdateGraph(l:gvpr_cmd)
 endfunction
 
-function! AddNode(label, command)
+function! AddNode(label, attributes)
   let l:gvpr_cmd = 
   \'BEG_G {' .
   \'  node_t new_node = node($, "' . a:label . '");' .
-  \'  aset(new_node,"command","'. a:command . '");' .
+      \join(map
+          \(deepcopy(a:attributes),
+          \'"aset(new_node,\"" . v:val[0] . "\",\"" . v:val[1] . "\");"')) .
   \'}' .
   \'N [] E []'
   call UpdateGraph(l:gvpr_cmd)
   let l:cur_node = GetSelectedNode()
-  if type(l:cur_node) == 1
+  if l:cur_node != -1
     call AddEdge(l:cur_node, a:label)
   endif
   call SelectNode(a:label)
@@ -111,53 +154,111 @@ function! MoveTo(gvpr_cmd)
   redraw!
 endfunction
 
-function! PrintChildren()
+function! GetChildren()
   let selected_node = GetSelectedNode()
-  if type(l:selected_node) == 1
+  if l:selected_node != -1
     let l:gvpr_cmd = 
       \'BEG_G { node_t selected_node = node($,"' . l:selected_node . '") }' .
       \'E [tail == selected_node] { printf("\%s\n", head.name) }'
-    call GetGraphInfo(l:gvpr_cmd)
+    return GetGraphInfo(l:gvpr_cmd)
   endif
 endfunction
 
-function! PrintParent()
+function! GetParent()
   let selected_node = GetSelectedNode()
-  if type(l:selected_node) == 1
+  if l:selected_node != -1
     let l:gvpr_cmd = 
       \'BEG_G { node_t selected_node = node($,"' . l:selected_node . '") }' .
       \'E [head == selected_node] { printf("\%s\n", tail.name) }'
-    call GetGraphInfo(l:gvpr_cmd)
+    return GetGraphInfo(l:gvpr_cmd)
   endif
 endfunction
 
+function! GetCommand()
+  let selected_node = GetSelectedNode()
+  if l:selected_node == -1 | return "" | endif
+  let l:gvpr_cmd = 
+    \'BEG_G {' .
+      \'node_t selected_node = node($,"' . l:selected_node . '"); ' .
+      \'printf("\%s\n", aget(selected_node, "command"))' .
+    \'}'
+  return GetGraphInfo(l:gvpr_cmd)
+endfunction
+
 function! Ascend()
-  call PrintParent()
-  call SelectNode(get(readfile(b:tmp_file), 0))
+  call SelectNode(GetParent()[0])
 endfunction
 
 function! Descend()
-  call PrintChildren()
-  call SelectNode(get(readfile(b:tmp_file), 0))
+  call SelectNode(GetChildren()[0])
+endfunction
+
+function! Sibling()
+  let selected_node = GetSelectedNode()
+  if l:selected_node != -1
+    call Ascend()
+    let l:children = GetChildren()
+    let idx = index(l:children, l:selected_node) + 1
+    let idx = l:idx % len(l:children)
+    call SelectNode(get(l:children, l:idx, ""))
+  endif
+  redraw!
+endfunction
+
+function! PushLocation()
+  let label = input("enter location name: ")
+  let cmd = 'view ' . expand("%:p") . ' | call setpos(\".\",' . string(getcurpos()) . ')'
+  call AddNode(l:label, s:location_attributes)
+  call AddCommand(l:label,l:cmd)
+endfunction
+
+"not safe... change 'command attribute' to 'command list'
+function! AddCommand(label, cmd)
+  "let new_cmd = string(GetCommand() + [a:cmd])
+  let new_cmd = GetCommand() . ' | ' . cmd
+  "echom string(GetCommands())
+  "echom l:new_cmd
+  call SetAttributes(a:label, ['command', l:new_cmd])
+endfunction
+
+function! PushCommand()
+  let new_cmd = input("enter command to add to node: ")
+  let node = GetSelectedNode()
+  if !empty(l:node) | AddCommand(l:node, l:new_cmd) | endif
+endfunction
+
+function! ExecuteSelected()
+  for cmd in GetCommands()
+    execute cmd
+  redraw!
 endfunction
 
 function! Test()
-  echom 'beginning test'
+  call Log(['beginning test'])
   call InitGraph()
-  call AddNode('one', 'foobar')
-  call AddNode('two', 'foobar2')
-  call Ascend()
-  call AddNode('three', 'foobar3')
-  call Ascend()
-  echom GetSelectedNode()
-  sleep 1
-  call Descend()
-  redraw!
+  call OpenGraph()
+  "call AddNode('one', [['command',':192'],['shape','square']])
+  "call AddNode('two', [['command',':' . line("'s")],['color','green']])
+  "call ExecuteSelected()
+  "call Ascend()
+  "call AddNode('three', [['command',':echo ''foobar'''],['peripheries','3']])
+  "call Sibling()
+  "call Sibling()
+  "call Ascend()
 endfunction!
 
+"mappings
+nnoremap <leader>gi :call InitGraph()
+nnoremap <leader>go :call OpenGraph()
+nnoremap <leader>ga :call Ascend()
+nnoremap <leader>gd :call Descend()
+nnoremap <leader>gs :call Sibling()
+nnoremap <leader>ge :call ExecuteSelected()
+nnoremap <leader>gp :call PushLocation()
+
 function! Foo(str)
-  execute 'echo "' . a:str[0] . '"'
-  return "gay"
+  if !len(a:str) | return | endif
+  echo 'bar'
 endfunction
 
 function! Bar(str)
