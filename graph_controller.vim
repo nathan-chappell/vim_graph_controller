@@ -30,26 +30,27 @@
 "be placed as a descendent of a node, indicating some hierarchical relationship
 "and can be a member of a subgraph, indicating some other meaningful semantics.
 
-"The graph and all relevant information is stored in $graph_file.  The $tmp_file
-"is necessary because gvpr kills your graph if you try to write to a file you're
-"currently trying to read from.
-
-let s:empty_graph = 'digraph { graph [ layout = dot, rankdir=LR ] }'
+let s:primary_root = 'primary_root'
+let s:empty_graph = 'digraph { graph [ layout = dot, rankdir=LR ] ' .
+  \ s:primary_root . ' [style = "invis", selected="true"] }'
 
 let s:debug_mode = 't'
-let s:log_file = '.graph_controller.log'
-call writefile([''], s:log_file)
+let s:graph_controller_dir = $HOME . '/.graph_controller'
+let s:log_file = s:graph_controller_dir . '/.graph_controller.log'
 
-function! InitLocals()
-  let b:graph_file = '.graph.dot'
-  let b:tmp_file = '.graph.dot.tmp'
-endfunction
+if !isdirectory(s:graph_controller_dir)
+  call mkdir(s:graph_controller_dir, '', 0777)
+endif
+call writefile([strftime('%c')], s:log_file,'a')
+
+let g:graph_file = $HOME . '/.graph_controller/.graph.dot'
 
 function! Log(items)
   call writefile(a:items + [''], s:log_file, 'a')
 endfunction
 
 function! LogSystemCmd(cmd)
+  "echom "logging: " . a:cmd
   let result = systemlist(a:cmd)
   if exists('s:debug_mode')
     call Log(['command: ' . a:cmd])
@@ -59,48 +60,53 @@ function! LogSystemCmd(cmd)
 endfunction
 
 function! UpdateGraph(gvpr_cmd)
-  let l:new_graph = LogSystemCmd("gvpr -q '" . a:gvpr_cmd . "' " . b:graph_file)
+  let l:new_graph = LogSystemCmd("gvpr -q '" . a:gvpr_cmd . "' " . g:graph_file)
   if !v:shell_error
-    call writefile(l:new_graph, b:graph_file)
+    call writefile(l:new_graph, g:graph_file)
   elseif
     Log(['gvpr error:', string(v:shell_error)])
   endif
 endfunction
 
 function! GetGraphInfo(gvpr_cmd)
-  return LogSystemCmd("gvpr -q '" . a:gvpr_cmd . "' " . b:graph_file)
+  return LogSystemCmd("gvpr -q '" . a:gvpr_cmd . "' " . g:graph_file)
 endfunction
 
 function! OpenGraph()
   "for some reason system() doesn't want to keep the thing open...
-  silent execute '! dot -Txlib ' . b:graph_file '. &'
+  silent execute '! dot -Txlib ' . g:graph_file '. &'
   redraw!
 endfunction
 
 function! InitGraph()
   call Log(['initializing graph for: ' . expand('%')])
-  call writefile([s:empty_graph], b:graph_file)
+  let g:graph_file = s:graph_controller_dir . '/' . 
+    \input("enter name for graph file: ", '.graph.dot')
+  call writefile([s:empty_graph], g:graph_file)
 endfunction
 
 function! GetSelectedNode()
   let l:gvpr_cmd = 
-    \'gvpr -q ''N [selected == "true"] { printf(name) } '' ' . b:graph_file
-  return get(LogSystemCmd(l:gvpr_cmd), 0, -1)
+    \'gvpr -q ''N [selected == "true"] { printf(name) } '' ' . g:graph_file
+  let result = LogSystemCmd(l:gvpr_cmd)[0]
+  return l:result
+endfunction
+
+function! IsRoot(node)
+  return a:node == s:primary_root
 endfunction
 
 let s:location_attributes = [["shape","rectangle"],["color","blue"]]
 
-function! SetAttributes(label, attributes)
-  if empty(a:attributes) | return | endif
-  call Log(['setting attributes: ' . a:label . ' - ' . string(a:attributes)])
+function! SetAttribute(label, attribute)
+  if empty(a:attribute) | return | endif
+  call Log(['setting attribute: ' . a:label . ' - ' . string(a:attribute)])
   let l:gvpr_cmd = 
-    \'BEG_G {'
-      \'node_t n = node($,'. a:label . ');' .
-      join(map
-          (deepcopy(a:attributes),
-          '"aset(n,\"" . v:val[0] . "\",\"" . v:val[1] . "\");"')) .
-    \'}' .
-    \'N [] E []'
+    \'BEG_G {' .
+      \ 'node_t update_node = node($,"'. a:label . '");' .
+      \ 'aset(update_node,"' . a:attribute[0] . '", "' . a:attribute[1] . '");' .
+    \ '}' .
+    \ 'N [] E []'
   call UpdateGraph(l:gvpr_cmd)
 endfunction
 
@@ -118,6 +124,34 @@ function! SelectNode(label)
   call UpdateGraph(l:gvpr_cmd)
 endfunction
 
+function! GetDescendents(label)
+  let l:gvpr_cmd = 
+  \'BEG_G {' .
+    \'node_t r = node($,"' . a:label . '"); ' .
+    \'int descendents[node_t]; ' .
+    \'descendents[r] = 1; ' .
+    \'$tvroot = r; ' .
+    \'$tvtype = TV_fwd; ' .
+  \'}' .
+  \'E [tail in descendents] {printf("\%s\n",head.name); descendents[head] = 1;}'
+  return GetGraphInfo(l:gvpr_cmd)
+endfunction
+
+function! DeleteSelectedNode()
+  let selected_node = GetSelectedNode()
+  let descendents = GetDescendents(l:selected_node)
+  let ignore_list = descendents
+  if !IsRoot(l:selected_node) | let ignore_list += [l:selected_node] | endif
+  let gvpr_cmd = 
+    \'BEG_G {' .
+      \'int descendents[string]; ' . 
+      \join(map(descendents, '"descendents[\"" . v:val . "\"] = 1"'), '; ') . 
+    \'}' .
+    \'N [!(name in descendents)] ' . 
+    \'E [!((head.name in descendents) || (tail.name in descendents))]'
+  call UpdateGraph(l:gvpr_cmd)
+endfunction
+
 function! AddNode(label, attributes)
   let l:gvpr_cmd = 
   \'BEG_G {' .
@@ -128,11 +162,25 @@ function! AddNode(label, attributes)
   \'}' .
   \'N [] E []'
   call UpdateGraph(l:gvpr_cmd)
-  let l:cur_node = GetSelectedNode()
-  if l:cur_node != -1
-    call AddEdge(l:cur_node, a:label)
+  let l:selected_node = GetSelectedNode()
+  if !IsRoot(l:selected_node)
+    call AddEdge(l:selected_node, a:label)
+  else
+    call AddRootEdge(a:label)
   endif
   call SelectNode(a:label)
+endfunction
+
+function! AddRootEdge(head)
+  let l:gvpr_cmd =
+  \'BEG_G {' .
+    \'node_t t = node($,"' . s:primary_root . '");' .
+    \'node_t h = node($,"' . a:head . '");' .
+    \'edge_t e = edge(t,h,"' . s:primary_root . ' -> ' . a:head . '");' .
+    \'aset(e,"style","invis");' .
+  \'}' .
+  \'N [] E []'
+  call UpdateGraph(l:gvpr_cmd)
 endfunction
 
 function! AddEdge(tail, head)
@@ -146,56 +194,50 @@ function! AddEdge(tail, head)
   call UpdateGraph(l:gvpr_cmd)
 endfunction
 
-function! MoveTo(gvpr_cmd)
-  let move_to = get(readfile(b:tmp_file), 0)
-  if type(l:move_to) == 1
-    call SelectNode(l:move_to)
-  endif
-  redraw!
-endfunction
-
 function! GetChildren()
   let selected_node = GetSelectedNode()
-  if l:selected_node != -1
-    let l:gvpr_cmd = 
-      \'BEG_G { node_t selected_node = node($,"' . l:selected_node . '") }' .
-      \'E [tail == selected_node] { printf("\%s\n", head.name) }'
-    return GetGraphInfo(l:gvpr_cmd)
-  endif
+  let l:gvpr_cmd = 
+    \'BEG_G { node_t selected_node = node($,"' . l:selected_node . '") }' .
+    \'E [tail == selected_node] { printf("\%s\n", head.name) }'
+  return GetGraphInfo(l:gvpr_cmd)
 endfunction
 
 function! GetParent()
   let selected_node = GetSelectedNode()
-  if l:selected_node != -1
+  if !IsRoot(l:selected_node)
     let l:gvpr_cmd = 
       \'BEG_G { node_t selected_node = node($,"' . l:selected_node . '") }' .
       \'E [head == selected_node] { printf("\%s\n", tail.name) }'
     return GetGraphInfo(l:gvpr_cmd)
   endif
+  return ''
 endfunction
 
 function! GetCommand()
   let selected_node = GetSelectedNode()
-  if l:selected_node == -1 | return "" | endif
+  if IsRoot(l:selected_node) | return "" | endif
   let l:gvpr_cmd = 
     \'BEG_G {' .
       \'node_t selected_node = node($,"' . l:selected_node . '"); ' .
       \'printf("\%s\n", aget(selected_node, "command"))' .
     \'}'
-  return GetGraphInfo(l:gvpr_cmd)
+  let result = get(GetGraphInfo(l:gvpr_cmd), 0, '')
+  return l:result
 endfunction
 
 function! Ascend()
-  call SelectNode(GetParent()[0])
+  let parent = get(GetParent(), 0, '')
+  if !empty(l:parent) | call SelectNode(l:parent) | endif
 endfunction
 
 function! Descend()
-  call SelectNode(GetChildren()[0])
+  let children = GetChildren()
+  if !empty(l:children) | call SelectNode(GetChildren()[0]) | endif
 endfunction
 
 function! Sibling()
   let selected_node = GetSelectedNode()
-  if l:selected_node != -1
+  if !IsRoot(l:selected_node)
     call Ascend()
     let l:children = GetChildren()
     let idx = index(l:children, l:selected_node) + 1
@@ -207,29 +249,35 @@ endfunction
 
 function! PushLocation()
   let label = input("enter location name: ")
-  let cmd = 'view ' . expand("%:p") . ' | call setpos(\".\",' . string(getcurpos()) . ')'
+  let cmd = 'view ' . expand("%:p") . ' | call setpos(".",' . string(getcurpos()) . ')'
   call AddNode(l:label, s:location_attributes)
   call AddCommand(l:label,l:cmd)
 endfunction
 
-"not safe... change 'command attribute' to 'command list'
+function! QuoteCommand(cmd)
+  return substitute(a:cmd, '"', '\\"', 'g')
+endfunction
+
 function! AddCommand(label, cmd)
-  "let new_cmd = string(GetCommand() + [a:cmd])
-  let new_cmd = GetCommand() . ' | ' . cmd
-  "echom string(GetCommands())
-  "echom l:new_cmd
-  call SetAttributes(a:label, ['command', l:new_cmd])
+  let old_cmds = split(GetCommand(), '|')
+  let new_cmd = join(l:old_cmds + [a:cmd], '|')
+  call SetAttribute(a:label, ['command', QuoteCommand(l:new_cmd)])
+endfunction
+
+function! PopCommand()
+  let old_cmds = split(GetCommand(), '|')
+  let new_cmd = join(l:old_cmds[:-2], '|')
+  call SetAttribute(a:label, ['command', QuoteCommand(l:new_cmd)])
 endfunction
 
 function! PushCommand()
   let new_cmd = input("enter command to add to node: ")
-  let node = GetSelectedNode()
-  if !empty(l:node) | AddCommand(l:node, l:new_cmd) | endif
+  let selected_node = GetSelectedNode()
+  if !IsRoot(l:selected_node) | call AddCommand(l:selected_node, l:new_cmd) | endif
 endfunction
 
 function! ExecuteSelected()
-  for cmd in GetCommands()
-    execute cmd
+  execute GetCommand()
   redraw!
 endfunction
 
@@ -255,6 +303,7 @@ nnoremap <leader>gd :call Descend()
 nnoremap <leader>gs :call Sibling()
 nnoremap <leader>ge :call ExecuteSelected()
 nnoremap <leader>gp :call PushLocation()
+nnoremap <leader>gc :call PushCommand()
 
 function! Foo(str)
   if !len(a:str) | return | endif
